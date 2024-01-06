@@ -1,0 +1,16 @@
+
+.c.obj:
+	$(CC) -c $(CFLAGS) $<
+!ifdef UPDATE
+	$(LIB) $(L)\$(LIBFILE) $(LIBFLAGS) -+$*
+!endif
+
+.asm.obj:
+	$(ASM) $*;
+!ifdef UPDATE
+	$(LIB) $(L)\$(LIBFILE) $(LIBFLAGS) -+$*
+!endif
+
+.c.asm:
+	$(CC) -S $(CFLAGS) $<
+	rename $*.asm $*.log

@@ -1,0 +1,14 @@
+# MAKEFILE (in each subdir of SRC\)
+# built by concatenating MAKE[123].ADD (in LIB\)
+# LIBFILE from file LIBFILE (in each subdir)
+# OBJS and dependency information collected by makemake program
+
+# the latter also makes xmodules and xbldlib
+
+# this makefile adds OBJS to relevant LIB if $(UPDATE) defined
+
+# The env var L3XCOPTS can be set to additional C compiler flags, defines ...
+
+!include ..\..\lib\config.mk
+
+

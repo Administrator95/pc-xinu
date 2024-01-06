@@ -1,0 +1,1796 @@
+/* create.c - create, newpid */
+
+#include <conf.h>
+#include <kernel.h>
+#include <io.h>
+#include <proc.h>
+#include <dos.h>
+#include <mem.h>
+
+typedef int (*fptr)();
+
+#define	INITF	0x0200	// initial flag register - set interrupt flag,
+						//	clear direction and trap flags
+
+extern	int	INITRET();	/* location to return to upon termination		*/
+
+/*------------------------------------------------------------------------
+ *  create  --  create a process to start running a procedure
+ *------------------------------------------------------------------------
+ */
+SYSCALL create(procaddr,ssize,priority,namep,nargs,args)
+fptr procaddr;			// procedure address
+word ssize;             // stack size in bytes
+short priority;			// process priority > 0
+char *namep;			// name (for debugging)
+int nargs;              // number of args that follow
+int args;               // arguments (treated like an array)
+{
+	int	pid;			// stores new process id
+	struct pentry *pptr;// pointer to proc. table entry
+    int i;              // loop variable
+	int	*currdevs;		// current device table
+	int	dev;			// device number for stdio
+    int *a;             // points to list of args
+    char *saddr;		// start of stack address
+	int *sp;			// stack pointer
+    int ps;				// saved processor status
+	int	die();			// execute upon process termination
+
+	disable(ps);
+	ssize = roundp(ssize);
+	if (ssize < MINSTK)
+		ssize = MINSTK;
+    if (priority < 1 || (pid=newpid()) == SYSERR ||
+        ((saddr=getstk(ssize)) == NULL ) ) {
+		restore(ps);
+        return(SYSERR);
+	}
+	numproc++;
+	pptr = &proctab[pid];
+    pptr->ssize = ssize;
+    pptr->pstate = PRSUSP;
+	pptr->pimmortl = TRUE;		// just for the time being...
+	for (i=0 ; i<PNMLEN ; i++)
+		pptr->pname[i] = (*namep ? *namep++ : ' ');
+	pptr->pname[PNMLEN]='\0';
+	pptr->pprio = priority;
+	pptr->pwaitret = 0;
+	pptr->phasmsg = FALSE;		// no message
+	pptr->pimmortl = FALSE;		// not immortal
+	pptr->pnxtkin = BADPID;		// no next-of-kin
+	pptr->pbase = saddr;
+	pptr->plen = ssize;
+    pptr->oldtime = 0;					// resched hasn't run it yet
+    pptr->time = 0;						// clear CPU time used
+    pptr->ptfn = die;					// initialize trap to die
+	pptr->ptarg = 0;
+	pptr->phastrap = FALSE;				// no trap yet
+	currdevs = proctab[currpid].pdevs;	// parent device table
+	
+	/* new process inherits open I/O devices of parent */
+	for (i=0 ; i<Nsio ; i++) {
+        dev = open(currdevs[i], NULLPTR);
+        if (isbaddev(dev)) 
+			pptr->pdevs[i] = BADDEV;
+		else
+            pptr->pdevs[i] = dev; 
+	}
+	pptr->pimmortl = FALSE;			// back to normal
+	sp = (int *)(saddr+ssize);		// simulate stack pointer	
+    sp -= 16;						// forse evita piccoli stack overflow?
+	pptr->pargs = nargs;
+	a = (&args) + nargs;			// point past last argument
+	for ( ; nargs > 0 ; nargs--)	// machine dependent; copy args
+        *(--sp) = *(--a);           //    onto created process' stack
+	*(--((fptr *) sp)) = INITRET;	// push on ret addr
+	*(--((fptr *) sp)) = procaddr;	// simulate a context switch
+    --sp;							// 1 word for bp
+    *(--sp) = INITF;				// FLAGS value
+    sp -= NSAVEREGS;				// words for si, di, ds
+	pptr->pregs = (char *)sp;		// save for context switch
+	pptr->paddr = procaddr;
+	restore(ps);
+	return(pid);
+}
+
+
+/*------------------------------------------------------------------------
+ *  newpid  --  obtain a new (free) process id
+ *------------------------------------------------------------------------
+ */
+LOCAL	newpid()
+{
+    int pid;		// process id to return
+	int	i;
+
+	for (i=0 ; i<NPROC ; i++) {		// check all NPROC slots
+		if ( (pid=nextproc--) <= 0)
+			nextproc = NPROC-1;
+		if (proctab[pid].pstate == PRFREE)
+			return(pid);
+	}
+	return(SYSERR);
+}
+/* die.c - die */
+
+#include <conf.h>
+#include <kernel.h>
+#include <proc.h>
+#include <sem.h>
+#include <dos.h>
+#include <io.h>
+
+/*------------------------------------------------------------------------
+ * die  --  terminate the current process and remove it from the system
+ *------------------------------------------------------------------------
+ */
+SYSCALL die(pid)
+int pid;
+{
+	struct	pentry	*pptr;
+	int	i;
+	int 	ps;
+	int	nok;
+/*	para	xb;
+	XBLOCK	*xbp;
+	word	npara;
+	word	alloc;
+*/
+	disable(ps);
+    pptr = &proctab[pid];       /* was currpid */
+	pptr->pprio = MAXINT;		/* make sure we go away fast	*/
+	pptr->pimmortl = TRUE;		/* disable any further kills	*/
+
+	/* close standard devices */
+	for (i=0 ; i<Nsio ; i++)
+		close(pptr->pdevs[i]);
+
+	/* inform next of kin about our death */
+	nok = pptr->pnxtkin;
+	pptr->pnxtkin = BADPID;
+    if ( nok != pid )           /* was currpid */
+        send(nok, pid);         /* was currpid */
+
+	/* free allocated memory */
+/*	xb = pptr->pmlist;
+	if (xb == 0)
+		panic("die: missing stack block");
+	xbp = (XBLOCK *)memp(xb);		// location of stack block 
+	xb = xbp->xbback;				// tail of list 
+	xbp->xbback = 0;				// make sure chase ends!
+	alloc = 0;
+	while (xb != 0) {
+		xbp = (XBLOCK *)memp(xb);
+		npara = xbp->xblen;
+		alloc += npara;
+		xb = xbp->xbback;			// work backwards to stack block
+		if (freemem((char *)xbp,npara<<4) == SYSERR)
+			panic("die: unable to free allocated memory");
+	}
+	if (alloc != pptr->pmalloc)
+		panic("die: inconsistent memory allocation");
+*/
+
+/*	N.B.: avendo rinunciato agli XBLOCK, devo almeno liberare il blocco
+ *	la memoria allocata da \t create() per il processo che ora muore.
+ *	Credo che questo blocco sia concatenato con lo slot pmlist, se si
+ *	usano gli XBLOCK
+ */
+	freestk(pptr->pbase, pptr->plen);
+
+	if ( --numproc == 0 )
+		xdone();
+
+	pptr->pstate = PRFREE;	/* suicide */
+	resched();
+	restore(ps);		/* never gets here */
+}
+/* kill.c - kill */
+
+#include <conf.h>
+#include <kernel.h>
+#include <proc.h>
+#include <sem.h>
+#include <dos.h>
+
+/*------------------------------------------------------------------------
+ * kill  --  kill a process and remove it from the system
+ *------------------------------------------------------------------------
+ */
+SYSCALL kill(pid)
+int	pid;			/* process to kill			*/
+{
+	struct	pentry	*pptr;
+	int 	ps;
+	int	die();
+
+	disable(ps);
+	if (isbadpid(pid) || (pptr= &proctab[pid])->pstate==PRFREE) {
+		restore(ps);
+		return(SYSERR);
+	}
+	if (pid == currpid)
+		die(pid);
+/*	if (pptr->pimmortl) {
+		send(pid, TMSGKILL);
+		restore(ps);
+		return(0);
+	}
+*/	switch (pptr->pstate) {
+	case PRWAIT:
+		semaph[pptr->psem].semcnt++;
+		/* fall through */
+	case PRREADY:
+		dequeue(pid);
+		break;
+
+	case PRSLEEP:
+	case PRTRECV:
+		unsleep(pid);
+		break;
+
+	default:
+		break;
+	}
+	pptr->pprio = MAXINT;
+	pptr->pstate = PRREADY;
+	
+/* Sembra che i processi vengano uccisi facendogli eseguire die()
+ * attraverso una trap!
+ * Questa è forse la ragione per cui eliminando il seguito, kill della shell
+ * non funziona bene, ma la kill originaria dovrebbe funzionare
+ */
+
+	pptr->ptfn = die;
+	pptr->ptarg = pid;
+	pptr->phastrap = TRUE;			// essenziale
+	insert(pid,rdyhead,MAXINT);
+	resched();
+	restore(ps);
+	return(OK);
+}
+/* xdone.c - xdone */
+
+#include <conf.h>
+#include <kernel.h>
+#include <proc.h>
+#include <io.h>
+#include <disk.h>
+#include <tty.h>
+
+extern char *memptr;
+extern int run;
+
+/*------------------------------------------------------------------------
+ *  xdone  --  print system termination message and terminate PC-Xinu
+ *------------------------------------------------------------------------
+ */
+int xdone()
+{
+	int	kprintf();
+    int ps, i, ret;
+
+#ifdef Ndsk
+	for ( i=0; i<Ndsk; i++ )
+		control(dstab[i].dnum,DSKSYNC);	/* sync the disks	*/
+#endif
+#ifdef Nsio
+    sleep(1);                           /* let tty output settle    */
+#endif
+    disable(ps);
+#ifdef WINDOWS
+    scrollup(0,0x184f,0,7);             /* clear the screen     */
+#endif
+    for ( i=0 ; i<NDEVS ; i++) {
+        ret = init(i,0);                /* un-initialize device */
+        if (ret != OK)
+            kprintf("xdone: error un-initializing device %d\n", i);
+    }
+	kprintf("\n\n-- system halt --\n\n");
+	if (numproc==0)
+		kprintf("All user processes have completed\n");
+	else
+        kprintf("terminated with %d process%s active\n",
+			numproc, ((numproc==1) ? "" : "es"));
+    kprintf("Returning to DOS . . .\n\n");
+    disable(ps);
+    maprestore();                       /* restore IRQs */
+    free(memptr);                       /* return malloced memory */
+    run=FALSE;                          /* kill the NULL process */    
+    return OK;
+}
+/* panic.c - panic, _panic */
+
+#include <dos.h>
+#include <conf.h>
+#include <kernel.h>
+#include <proc.h>
+#include <io.h>
+#include <tty.h>
+#include <pc.h>
+
+extern int run;
+
+/*------------------------------------------------------------------------
+ *  panic  --  print error message and terminate PC-Xinu
+ *------------------------------------------------------------------------
+ */
+int panic(cp)
+char *cp;
+{
+    int i, pid;
+	int kprintf();
+	int	ps;
+
+	disable(ps);
+	pid = getpid();
+	maprestore();			/* restore interrupts to DOS	*/
+	for ( i=0 ; i<NDEVS ; i++)
+		if (init(i,0) != OK)
+			kprintf("xdone: error un-initializing device %d\n", i);
+	enable();
+	kprintf("\n\n-- panic stop (pid=%d) --\n%s\n\n", pid, cp);
+	if ( numproc == 0 )
+		kprintf("All user processes have completed\n");
+	else
+        kprintf("XINU 7.9 terminated with %d process%s active\n",
+			numproc, ((numproc==1) ? "" : "es"));
+	kprintf("Returning . . .\n\n");
+    run = FALSE;
+    return SYSERR;             /* return to caller     */
+}
+
+#define MAXSPRINT	6		/* max stack values to print	*/
+
+static int i;				/* counter for printing stack	*/
+static char *ep;			/* error message pointer	*/
+static struct pentry *pp;		/* pointer to this proc. entry	*/
+static int *sp;				/* pointer to original stack	*/
+int *sys_getstk();
+
+/*------------------------------------------------------------------------
+ *  _panic  --  exception handler, called by exception interrupts
+ *------------------------------------------------------------------------
+ */
+_panic(typ)
+int typ;				/* exception type		*/
+{
+	maprestore();
+	switch (typ) {
+	case DB0VEC:
+		ep = "Divide by zero";
+		break;
+	case SSTEPVEC:
+		ep = "Single step";
+		break;
+	case BKPTVEC:
+		ep = "Breakpoint";
+		break;
+	case OFLOWVEC:
+		ep = "Arithmetic overflow";
+		break;
+	default:
+		ep = "Unknown interrupt";
+	}
+	kprintf("\n\n-- panic stop -- \n");
+	kprintf("panic: trap type %d (%s) \n",typ,ep);
+	pp = &proctab[currpid];
+	kprintf("process pid=%d name=%s \n",currpid,pp->pname);
+	sp = sys_getstk();		/* retrieve stack parameters	*/
+	sp += 13;			/* actual top of user stack	*/
+	kprintf("state: ax=%04x bx=%04x cx=%04x dx=%04x",
+		*(sp-6),*(sp-7),*(sp-8),*(sp-9));
+	kprintf(" si=%04x di=%04x bp=%04x sp=%04x \n",
+		*(sp-10),*(sp-11),*(sp-5),FP_OFF(sp));
+	kprintf("       cs=%04x ds=%04x ss=%04x es=%04x",
+		*(sp-2),*(sp-12),FP_SEG(sp),*(sp-13));
+	kprintf(" ip=%04x fl=%04x \n",*(sp-3),*(sp-1));
+	kprintf("stack dump:      \n");
+	for ( i=0 ; i<MAXSPRINT ; i++, sp++ )
+		kprintf("       sp=%04x *sp=%04x \n",FP_OFF(sp),*sp);
+	kprintf("\nPC-Xinu terminated with %d process%s active \n",
+		numproc, ((numproc==1) ? "" : "es"));
+	kprintf("Returning . . . \n\n");
+	halt();				/* return to caller		*/
+}
+/* resched.c - resched */
+
+#include <conf.h>
+#include <kernel.h>
+#include <proc.h>
+#include <dos.h>
+#include <q.h>
+#include <sleep.h>
+
+/*------------------------------------------------------------------------
+ *  resched  --  reschedule processor to highest priority ready process
+ *
+ * Notes:	Upon entry, currpid gives current process id.
+ *		Proctab[currpid].pstate gives correct NEXT state for
+ *			current process if other than PRCURR.
+ *------------------------------------------------------------------------
+ */
+int	resched()
+{
+    struct pentry  *optr;  /* pointer to old process entry */
+    struct pentry  *nptr;  /* pointer to new process entry */
+
+    proctab[currpid].time = proctab[currpid].time + tod
+                            - proctab[currpid].oldtime;
+
+    optr = &proctab[currpid];
+    if ( optr->pstate == PRCURR ) {
+		/* no switch needed if current prio. higher than next	*/
+        if (lastkey(rdytail) < optr->pprio ) {
+            optr->oldtime = tod;
+            preempt = 20 /*QUANTUM*/;
+            return;
+        }
+        /* or if rescheduling is disabled ( pcxflag == 0 )    */
+        if (sys_pcxget() == 0) {
+            optr->oldtime = tod;
+            preempt = 1;
+            return;
+        }
+		/* force context switch */
+		optr->pstate = PRREADY;
+		insert(currpid,rdyhead,optr->pprio);
+    } 
+    else if ( sys_pcxget() == 0 ) {
+        kprintf("pid=%d state=%d name=%s",
+            currpid,optr->pstate,optr->pname);
+        panic("Reschedule impossible in this state");
+    }
+
+	/* remove highest priority process at end of ready list */
+
+	nptr = &proctab[(currpid=getlast(rdytail))];
+	nptr->pstate = PRCURR;		/* mark it currently running	*/
+//    preempt = QUANTUM;          /* reset preemption counter */
+    preempt = 20;
+//    _pglob = nptr->pglob;       /* retrieve global environment  */
+
+    proctab[currpid].oldtime=tod;
+    ctxsw(&optr->pregs,&nptr->pregs);
+
+	if (currpid != 0 && FP_OFF(optr->pregs) > optr->plen)
+		panic("stack overflow");
+	if (optr->phastrap) {
+		optr->phastrap = FALSE;	/* mark trap as serviced	*/
+        if (optr->ptfn != NULL)
+			(*optr->ptfn)(optr->ptarg);
+	}
+
+	/* The OLD process returns here when resumed. */
+	return;
+}
+/* resume.c - resume */
+
+#include <conf.h>
+#include <kernel.h>
+#include <proc.h>
+
+/*------------------------------------------------------------------------
+ *  resume  --  unsuspend a process, making it ready; return the priority
+ *------------------------------------------------------------------------
+ */
+
+SYSCALL resume(pid)
+int pid;
+{
+	int	ps;						/* saved processor status	*/
+	struct	pentry	*pptr;		/* pointer to proc. tab. entry	*/
+	int	prio;					/* priority to return		*/
+
+	disable(ps);
+	if (isbadpid(pid) || (pptr = &proctab[pid])->pstate != PRSUSP) {
+		restore(ps);
+		return(SYSERR);
+	}
+	prio = pptr->pprio;
+	ready(pid);
+	resched();
+	restore(ps);
+	return(prio);
+}
+/* sdelete.c - sdelete */
+
+#include <conf.h>
+#include <kernel.h>
+#include <proc.h>
+#include <q.h>
+#include <sem.h>
+
+/*------------------------------------------------------------------------
+ *  sdelete  --  delete a semaphore by releasing its table entry
+ *------------------------------------------------------------------------
+ */
+SYSCALL sdelete(sem)
+	int	sem;
+{
+	int	ps;
+	int	pid;
+	struct	sentry	*sptr;		/* address of sem to free	*/
+	int	slist;
+	int	freect;			/* number of freed processes	*/
+
+	disable(ps);
+	if ( isbadsem(sem) || semaph[sem].sstate==SFREE ) {
+		restore(ps);
+		return(SYSERR);
+	}
+	sptr = &semaph[sem];
+	slist = sptr->sqhead;
+	sptr->sstate = SFREE;
+	freect = 0;
+	while ( (pid=getfirst(slist)) != EMPTY ) {
+		ready(pid);
+		freect++;
+	}
+	resched();
+	restore(ps);
+	return(freect);
+}
+/* sreset.c - sreset */
+
+#include <conf.h>
+#include <kernel.h>
+#include <proc.h>
+#include <q.h>
+#include <sem.h>
+
+/*------------------------------------------------------------------------
+ *  sreset  --  reset the count and queue of a semaphore
+ *------------------------------------------------------------------------
+ */
+SYSCALL sreset(sem,count)
+	int	sem;
+	int	count;
+{
+	struct	sentry	*sptr;
+	int	ps;
+	int	pid;
+	int	slist;
+	int	freect;			/* number of freed processes	*/
+
+	disable(ps);
+	if ( isbadsem(sem) || count<0 || semaph[sem].sstate==SFREE ) {
+		restore(ps);
+		return(SYSERR);
+	}
+	sptr = &semaph[sem];
+	slist = sptr->sqhead;
+	sptr->semcnt = count;
+	freect = 0;
+	while ( (pid=getfirst(slist)) != EMPTY ) {
+		ready(pid);
+		freect++;
+	}
+	resched();
+	restore(ps);
+	return(freect);
+}
+/* wait.c - wait */
+
+#include <conf.h>
+#include <kernel.h>
+#include <proc.h>
+#include <q.h>
+#include <sem.h>
+
+/*------------------------------------------------------------------------
+ *  wait  --  make current process wait on a semaphore
+ *------------------------------------------------------------------------
+ */
+SYSCALL	wait(sem)
+	int sem;
+{
+	int ps;
+	register struct	sentry	*sptr;
+	register struct	pentry	*pptr;
+
+	disable(ps);
+	if (isbadsem(sem) || (sptr = &semaph[sem])->sstate == SFREE) {
+		restore(ps);
+        return(SYSERR);
+	}
+	if ( --sptr->semcnt < 0 ) {
+		pptr = &proctab[currpid];
+		pptr->pstate = PRWAIT;
+		pptr->psem = sem;
+		enqueue(currpid,sptr->sqtail);
+		resched();
+	}
+	restore(ps);
+	return(OK);
+}
+/* initialize.c - main, sysinit */
+
+#include <dos.h>
+#include <conf.h>
+#include <kernel.h>
+#include <io.h>
+#include <proc.h>
+#include <sem.h>
+#include <q.h>
+#include <shell.h>
+#include <butler.h>
+#include <pc.h>
+#include <kbdio.h>
+#include <bufpool.h>
+
+
+
+#ifdef	Ntty
+#include <tty.h>
+int winofcur;               /* define the current input window  */
+struct tty  tty[Ntty];      /* window buffers and mode control  */
+#endif
+
+
+#ifdef 	Nmf
+#include <mffile.h>
+struct mfblk mftab[Nmf];
+#endif
+
+/* Declarations of major kernel variables */
+
+struct  pentry  proctab[NPROC];     /* process table            */
+int     nextproc;                   /* next process slot to use in create */
+struct  sentry  semaph[NSEM];       /* semaphore table          */
+int     nextsem;                    /* next semaphore slot to use in screate*/
+struct  qent    q[NQENT];           /* q table (see queue.c)        */
+int     nextqueue;                  /* next slot in q structure to use  */
+
+MBLOCK  memlist;                    /* list of free memory blocks       */
+para endaddr;                       /* beginning of free memory (was para)*/
+para maxaddr;                       /* end of free memory (was para)*/
+
+/* PC-specific variables */
+
+int     nmaps;                      /* no. of active intmap entries     */
+
+/* active system state */
+
+int     numproc;                    /* number of live user processes    */
+int     currpid;                    /* id of currently running process  */
+char    *memptr;                    /* mallocated memory */
+int     run;                        /* TRUE while Xinu is running */
+
+/* real-time clock variables and sleeping process queue pointers	*/
+
+long    tod;                        /* time-of-day (tics since startup) */
+long    startup;
+int     defclk;                     /* non-zero, then deferring clock count */
+int     clkdiff;                    /* deferred clock ticks         */
+int     slnempty;                   /* FALSE if the sleep queue is empty    */
+int     *sltop;                     /* address of key part of top entry in  */
+                                    /* the sleep queue if slnonempty==TRUE  */
+int     clockq;                     /* head of queue of sleeping processes  */
+int     preempt;                    /* preemption counter.  Current process */
+                                    /* is preempted when it reaches zero;   */
+                                    /* set in resched; counts in ticks  */
+
+/* local typedef declaration */
+
+typedef	unsigned long	big;
+
+/* miscellaneous system variables */
+
+int     butlerpid;                  /* pid of butler process        */
+int     sysmsg;                     /* message queue            */
+int     rdyhead,rdytail;            /* head/tail of ready list (q indexes)  */
+
+extern unsigned _stklen;
+char    *sys_stknpr();
+unsigned long curr_sp; 
+
+#define NULLNM  "**NULL**"          /* null process name            */
+
+/************************************************************************/
+/***                NOTE:                                             ***/
+/***                                                                  ***/
+/***   This is where the system begins after the C environment has    ***/
+/***   been established.  Interrupts are initially DISABLED, and      ***/
+/***   must eventually be enabled explicitly.  This routine turns     ***/
+/***   itself into the null process after initialization.  Because    ***/
+/***   the null process must always remain ready to run, it cannot    ***/
+/***   execute code that might cause it to be suspended, wait for a   ***/
+/***   semaphore, or put to sleep, or exit.  In particular, it must   ***/
+/***   not do I/O unless it uses kprintf for console output.          ***/
+/***                                                                  ***/
+/************************************************************************/
+
+/*------------------------------------------------------------------------
+ *  main  --  initialize system and become the null process (id==0)
+ *------------------------------------------------------------------------
+ */
+main(argc,argv)                     /* babysit CPU when no one home */
+int argc;
+char *argv[];
+{
+    int     xmain();                /* user's main procedure    */
+    int     butler();               /* BUTLER process       */
+    int     ps;                     /* save processor flags     */
+    int     pcx;                    /* reschedule flag      */
+    big     maxmem;                 /* maximum memory location  */
+    big     endmem;                 /* start of free memory     */
+
+    curr_sp = (unsigned long) sys_stknpr(); /* save current stack pointer */
+    
+    while ( kbdgetc() != NOCH )     /* eat remaining kbd chars  */
+            ;
+    kprintf("Initializing . . .\n");
+    disable(ps);
+    xdisable(pcx);
+    if ( sysinit() == SYSERR ) {    /* initialize all of PC-Xinu    */
+		kprintf("PC-Xinu initialization error\n");
+		maprestore();
+		restore(ps);
+		exit(1);
+	}
+	restore(ps);
+    gettime(&startup);
+    maxmem = (big)maxaddr << 4;
+    endmem = (big)endaddr << 4;
+    kprintf("\nXINU Version %s\n", VERSION);
+    kprintf("%lu real mem\n",maxmem);
+    kprintf("%lu base addr\n",endmem);
+    kprintf("%lu avail mem\n\n", maxmem - endmem);
+    xrestore(pcx);                  /* XINU is now running */
+    run=TRUE;
+
+    /* start the butler process */
+
+    butlerpid=create(butler,BTLRSTK,BTLRPRIO,BTLRNAME,0); 
+    resume(butlerpid);
+
+    /* create the user process */
+    resume(create(xmain,0x800,INITPRIO,"xmain",3,argc,argv));
+
+    while (run)                 /* run until someone tells us to stop */
+       pause();
+}
+
+#define UL	unsigned long
+
+/*------------------------------------------------------------------------
+ *  sysinit  --  initialize all PC-Xinu data structures and devices
+ *------------------------------------------------------------------------
+ */
+
+LOCAL sysinit()
+{
+	int		i,j;
+	struct pentry	*pptr;
+	struct sentry	*sptr;
+	struct mblock	*mptr;
+    char    *farmalloc();           /* C memory allocator       */
+    int     xdone();                /* terminate xinu       */
+    char    *namep;                 /* null process name pointer    */
+    word    nblks;                  /* number of paragraphs to get  */
+    para    sizmem;                 /* memory sizing        */
+    struct devsw *dvptr;            /* pointer to devtab entry  */
+    unsigned long avmem;
+    char *ptr;
+    int ps;
+            
+    nmaps=0;                        /* no. of active intmap entries */
+    numproc = 0;                    /* initialize system variables  */
+	nextproc = NPROC-1;
+	nextsem = NSEM-1;
+    nextqueue = NPROC;              /* q[0..NPROC-1] are processes  */
+
+    avmem = coreleft();                 /* determine bytes of memory left */
+    memptr=farmalloc(avmem);            /* get the lot */
+    disable(ps);                        /* farmalloc turns ints on ! */
+    sizmem=avmem >> 4;                  /* convert to paragraphs */
+    endaddr = FP_SEG(memptr);           /* start of free memory (para)  */
+	if (FP_OFF(memptr) != 0){
+		sizmem--;
+        endaddr++;                      /* adjust to para boundary  */
+	}
+    maxaddr = endaddr + sizmem;         /* top of free memory (para)    */
+    memlist.mnext = endaddr;            /* initialize free memory list  */
+	memlist.mlen = sizmem;
+
+    mptr = (MBLOCK *)MK_FP(endaddr,0);
+	mptr->mnext = 0;
+	mptr->mlen = sizmem;
+
+    for (i=0 ; i<NPROC ; i++)       /* initialize process table */
+		proctab[i].pstate = PRFREE;
+
+    ptr = &proctab[0];
+    for (i=0 ; i<sizeof(struct pentry); i++)
+        ptr[i]=0;
+     
+    pptr = &proctab[NULLPROC];      /* initialize null process entry */
+    pptr->pstate = PRCURR;
+    pptr->pprio = 0;
+    pptr->oldtime = 0;
+    pptr->time = 0;
+  
+    ptr = sys_stknpr();
+    pptr->pbase = (char *) (sys_stknpr() - FP_OFF(ptr));	// compute pbase
+    pptr->pregs = (char *) sys_stknpr();					// current sp
+    pptr->ssize = 0x1000;								// I happen to know this
+    
+    namep=NULLNM;
+    for (j=0; j<PNMLEN; j++)
+        pptr->pname[j] = (*namep ? *namep++ : ' ');
+    pptr->pname[PNMLEN] = '\0';
+    pptr->paddr = main;
+    pptr->pargs = 0;
+
+#ifdef Nsio
+	/* STDIN, STDOUT, STDERR */
+	for (i=0 ; i < Nsio ; i++)
+		pptr->pdevs[i] = (i<3) ? CONSOLE : BADDEV;
+#endif
+
+    currpid = NULLPROC;
+
+    for (i=0 ; i<NSEM ; i++) {      /* initialize semaphores    */
+		(sptr = &semaph[i])->sstate = SFREE;
+		sptr->sqtail = 1 + (sptr->sqhead = newqueue());
+	}
+    rdytail=1+(rdyhead=newqueue()); /* initialize ready list */
+
+#ifdef	MEMMARK
+    _mkinit();                      /* initialize memory marking    */
+#else
+    pinit();                        /* initialize ports     */
+    poolinit();                     /* initialize the buffer pools  */
+#endif
+
+    clkinit();                      /* initialize real-time clock   */
+
+#ifdef	Ndsk
+    dskdbp=mkpool(DBUFSIZ, NDBUFF); /* initialize disk buffers     */
+	dskrbp= mkpool(DREQSIZ, NDREQ);
+#endif
+
+#ifdef	Ntty
+    winofcur = 0;                   /* initialize current window    */
+#endif
+
+/* set up low-level interrupt vectors */
+
+    mapinit(DB0VEC, _panic, DB0VEC);        /* divide by zero   */
+    mapinit(SSTEPVEC, _panic, SSTEPVEC);    /* single step      */
+    mapinit(BKPTVEC, _panic, BKPTVEC);      /* breakpoint       */
+    mapinit(OFLOWVEC, _panic, OFLOWVEC);    /* overflow     */
+    mapinit(CBRKVEC, cbrkint, CBRKVEC);     /* ctrl-break       */
+
+#ifdef	NDEVS
+	for ( i=0 ; i<NDEVS ; i++ ) {	/* initialize devices		*/
+		dvptr = &devtab[i];
+		if ( dvptr->dvivec && mapinit(dvptr->dvivec,
+				dvptr->dviint, dvptr->dvminor) == SYSERR )
+			goto uninit;
+		if (dvptr->dvovec && mapinit(dvptr->dvovec,
+				dvptr->dvoint, dvptr->dvminor) == SYSERR )
+			goto uninit;
+		if (init(i,1) == OK)	/* initialize the device */
+			continue;
+uninit:
+		kprintf("initiali.c: error initializing device %d\n", i);
+		while (--i > 0)
+			init(i,0);
+		return(SYSERR);
+	}
+#endif
+
+    if (mapinit(CLKVEC|BIOSFLG, clkint, 0) == SYSERR)
+        return(SYSERR);
+
+   return(OK);
+}
+/* getss.c -- get_cur_ss  
+ * 
+ * check if stack saved in sssave/spsave is that of current process
+ */
+
+/*          ** call only with ints disabled **                 */
+
+
+#include <conf.h>
+#include <kernel.h>
+#include <proc.h>
+#include <dos.h>
+
+extern long sys_getstk();
+extern int kprintf();
+
+int get_cur_ss()
+{
+	long curr_stk;
+	long proc_stk_base;
+	long proc_stk_top;
+	int ret;
+
+	curr_stk = (long) sys_getstk();
+
+	proc_stk_base = (long) proctab[currpid].pbase;
+	proc_stk_top  = (long) proctab[currpid].pbase + 
+					proctab[currpid].ssize;
+
+	ret = (curr_stk >= proc_stk_base) && (curr_stk <= proc_stk_top);
+
+#ifdef DEBUG
+#define STKMSG "\
+Interrupted code stack pointer:       %lx\n\
+Interrupted process stack base-limit: %lx-%lx\n\n"
+	if (!ret)
+		kprintf(STKMSG, curr_stk, proc_stk_base, proc_stk_top);				
+#endif
+
+	return(ret); 
+}
+/* x_butler.c  -  x_butler */
+
+// Does not appear to work correctly without windows
+// but it doesn't for the original XINU 7.9 either!
+
+#include <conf.h>
+#include <kernel.h>
+#include <proc.h>
+#include <dos.h>
+#include <q.h>
+
+static char *sttab[8] = {
+	"???",
+	"current",
+	"free",
+	"ready",
+	"receiving",
+	"sleeping ",
+	"suspended",
+	"waiting"
+};
+
+
+static struct psnap {
+	int	state;
+	int	prio;
+	char	name[10];
+	char	*pbase;
+	int	plen;
+	char	*pregs;
+} stab[NPROC];
+
+static int pmark[NPROC];
+static char qname[4];
+
+
+#define CTRLC		3			/* ASCII code for control-C*/
+#define STATE(s)	sttab[((s)>0&&(s)<8)?(s):0]
+#define next(i)		q[(i)].qnext
+#define prev(i) 	q[(i)].qprev
+#define key(i)		q[(i)].qkey
+
+
+/*------------------------------------------------------------------------
+ *  x_butler  --  (command butler) print process information
+ *------------------------------------------------------------------------
+ */
+COMMAND  x_butler(nargs,args)
+int  nargs;
+char *args[];
+{
+	int	i,j,s;
+
+	if ( nargs > 1 ) {
+		fprintf(STDERR,"Usage: butler\n");
+		return(SYSERR);
+	}
+	pprint();
+	printf("Press any key to continue . . .");
+	if ( kgetc(0) == CTRLC )
+		return(OK);
+	printf("\n");
+	for ( i=0; i<NPROC; i++ )
+		pmark[i] = 0;
+	/* print the semaphore queues */
+	i = NPROC;
+	for ( j=0; j<NSEM; j++ ) {
+		qname[0] = 'S';
+		qname[1] = '0'+(j/10);
+		qname[2] = '0'+(j%10);
+		qname[3] = 0;
+		qprint(i,qname,PRWAIT,0);
+		i += 2;
+	}
+	qprint(i,"RDY",PRREADY,1);
+	i += 2;
+	qprint(i,"SLP",PRSLEEP,1);
+	for ( i=0 ; i<NPROC; i++ )
+		if ( pmark[i] == 0 ) {
+			s = stab[i].state;
+			if ( s == PRWAIT || s == PRREADY || s == PRSLEEP )
+				printf("?%02d: %s %s\n",i,
+				    stab[i].name,STATE(s));
+		}
+}
+
+
+LOCAL  pprint()
+{
+	int	i,j;
+	int	s;
+	int	*addr;
+	struct	pentry *pptr;
+	struct	psnap *sptr;
+
+	printf("\n id state      prio name        sp   ss  top");
+	printf("   di   si flag   bp\n");
+	for ( i=0; i<NPROC; i++ ) {
+		pptr = &proctab[i];
+		sptr = &stab[i];
+		sptr->state = pptr->pstate;
+		sptr->prio = pptr->pprio;
+		strcpy(sptr->name,pptr->pname);
+		sptr->pbase = pptr->pbase;
+		sptr->plen = pptr->plen;
+		sptr->pregs = pptr->pregs;
+	}
+	for ( i=0; i<NPROC; i++ ) {
+		sptr = &stab[i];	/* pointer to process entry	*/
+		if ( (s=sptr->state) != PRFREE ) {
+			printf("%3d %-9s %5d %s",
+				i,STATE(s),
+				sptr->prio,sptr->name);
+			printf(" %04x %04x %04x",FP_OFF(sptr->pregs),
+				FP_SEG(sptr->pregs),sptr->plen);
+			if ( s != PRCURR ) {
+				addr = (int *) sptr->pregs;
+				for (j=0; j<4; j++ )
+					printf(" %04x",*addr++);
+			}
+			printf("\n");
+		}
+	}
+}
+
+
+LOCAL qprint(i,qnam,state,keyprint)
+int i;
+char *qnam;
+int state;
+int keyprint;
+{
+	int	ni,pi,s;
+
+	if ( prev(i) != EMPTY )
+		printf("%s: nonempty qprev header\n",qnam);
+	if ( next(i+1) != EMPTY )
+		printf("%s: nonempty qnext header\n",qnam);
+	for ( ni=next(i), pi=i ; ni < NPROC ; pi=ni, ni=next(ni) ) {
+		printf("%s: pid=%02d",qnam,ni);
+		if ( ni < 0 ) {
+			printf(" ?queue index corrupted!\n");
+			break;
+		}
+		printf(" %s",stab[ni].name);
+		if ( keyprint )
+			printf(" key=%d",key(ni));
+		if ( pmark[ni]++ != 0 ) {
+			printf(" ?process on another queue!\n");
+			break;
+		}
+		s = stab[ni].state;
+		if ( s != state )
+			printf(" ?illegal state (%d=%s)",s,STATE(s));
+		if ( prev(ni) != pi )
+			printf(" ?invalid qprev index (%d)",prev(ni));
+		printf("\n");
+	}
+	if ( prev(ni) != pi ) {
+		printf("%s: ?invalid qprev index (%d)",qnam,prev(ni));
+	}
+	if ( ni != i+1 )
+		printf("%s: ?queue terminates incorrectly (%d)",qnam,ni);
+	if ( pi != i )
+		printf("----\n");
+	return(OK);
+}
+/* shell.c - shell */
+
+#include <conf.h>
+#include <kernel.h>
+#include <proc.h>
+#include <io.h>
+#include <shell.h>
+#include <cmd.h>
+#include <tty.h>
+#include <name.h>
+//#include <mem.h>
+
+/* Global error messages */
+LOCAL   char    fmt[]   = "shell: cannot open %s\n";
+LOCAL	char	fmt2[]  = "[%d]\n";
+
+extern long recvclr();
+
+/*------------------------------------------------------------------------
+ *  shell  --  Xinu shell with file redirection and background processing
+ *------------------------------------------------------------------------
+ */
+shell(nargs,args)
+int nargs;
+char *args[];
+{
+	struct  shvars *shptr;
+	int     ncargs, len;
+	int     toktype;                    /* Token type from lexan */
+	char    *tokptr;                    /* Pointer to token's text */
+	char    *innam, *outnam, *errnam;   /* Names for I/O redirection */
+	Bool	backgnd;
+	int     com, i, j;
+	int     child;
+	int     pipe;
+	int     terminate;
+	long    msg;
+    
+//	if ((shptr=getmem((word) sizeof(struct shvars)))==SYSERR) {
+	if ((shptr=getmem(sizeof(struct shvars)))==SYSERR) {
+		fprintf(STDERR,"shell: not enough memory\n");
+		return(SYSERR);
+	}
+	shptr->shlastc = '\n';
+	shptr->shnextc = shptr->shend = shptr->shbuf;
+	shptr->shprompt[0] = shptr->shprcon[0] = NULLCH;
+	if (nargs < 2)
+		shptr->shcmddev = STDIN;
+	else if (nargs > 2 && strcmp(args[1],"-c") == 0) {
+		shptr->shnextc = args[2];
+		shptr->shend = args[2] +strlen(args[2]);
+		shptr->shcmddev = BADDEV;
+	}
+	else { 
+		shptr->shcmddev=fopen(args[1], "ro");
+		if (shptr->shcmddev == SYSERR) {
+			fprintf(STDERR, fmt, args[1]);
+			freemem(shptr, (word) sizeof(struct shvars));
+			return(SYSERR);
+		}
+	}
+
+	if (shptr->shcmddev == STDIN &&
+		getpdev(getpid(), STDIN) == getpdev(getpid(), STDOUT)) {
+		strcpy(shptr->shprompt, "% ");
+		strcpy(shptr->shprcon, "> ");
+	}
+
+	pipe = 0;                               /* we must remember pipe */
+	terminate = FALSE;
+
+	/* Main loop: carry on until user types CTRL-D */
+
+	for (toktype = '\n' ; toktype != EOF ; ) {
+//		getutim(&Log.llast);
+	    if (toktype == '\n')
+			shgetc(shptr, shptr->shprompt);  /* Read cmd line */
+		innam = outnam = errnam = NULL;
+		backgnd = FALSE;
+		ncargs = 0;
+		tokptr = shptr->shstrbuf;
+		len = 0;
+
+		/* Each while loop parses an input line */
+
+		while ((toktype=lexan(tokptr,shptr)) != EOF && toktype != '|' &&
+				toktype !='\n' && toktype !=';' && toktype != '&') {
+
+			switch (toktype) {
+			case '<':           /* I/O redirection */
+			case '>':
+			case '^':
+				for ( ; ; toktype=lexan(tokptr,shptr)) {
+					switch (toktype) {
+					case '<': innam =  tokptr; continue;
+					case '>': outnam = tokptr; continue;
+					case '^': errnam = tokptr; continue;
+					default: break;
+					}
+					break;
+				}
+				if (toktype != '"') {
+					fprintf(STDERR, "shell: no redirect name \n");
+					break;
+				}
+				tokptr += strlen(tokptr) + 1;
+				continue; 
+			case ')':		/* Unbalanced right paren */
+				fprintf(STDERR, "shell: unbalanced \")\"\n");
+				break;
+			case '(':		/* Command to run in subshell */
+				if (ncargs > 0) {
+					fprintf(STDERR, "shell: misplaced \"(\"\n");
+					break;
+				}
+				shptr->shargs[ncargs++] = SHNAME;
+				shptr->shargs[ncargs++] = "-c";
+				len += sizeof(SHNAME) +3;
+			/* Fall through */
+			default:		/* String added to arg list */
+				shptr->shargs[ncargs++] = tokptr;
+				len    += strlen(tokptr) + 1;
+				tokptr += strlen(tokptr) + 1;
+				continue;
+			}// switch(toktyp)
+
+			ncargs = 0;				/* Error: ignore command line */
+			shptr->shnextc = shptr->shend;
+			if (shptr->shcmddev != STDIN)
+				toktype = EOF;		/* Ignore rest of line */
+			break;
+
+		}// end line analysis while loop
+
+	    if (ncargs == 0)
+	       continue;
+	    backgnd = (toktype == '&' || toktype == '|');
+	    shptr->shargs[ncargs] = NULL;
+
+		/* check for #!command */
+
+		if ((shptr->shargs[0][0]=='#') && (shptr->shargs[0][1]=='!')) {
+			shptr->shargs[0] += 2;                  /* point past the #! */
+			len -= 2;
+			terminate = TRUE;
+			for (i=ncargs, j=1; j < nargs ; i++, j++) {	// copy args
+				shptr->shargs[i] = shptr->shargs[i-1] +
+					strlen(shptr->shargs[i-1]) + 1;
+				strcpy(shptr->shargs[i], args[j]);
+				len += strlen(args[j]) + 1;
+				ncargs++;
+			}
+		} 
+
+		/* Look up command in command table */
+
+		for (com = 0 ; com < ncmds ; com++)
+			if (strcmp(cmds[com].cmdnam, shptr->shargs[0])==0)
+				break;
+
+	   /* Command could be a file so do: sh command args */
+
+		if (com >= ncmds) {
+			for (i=ncargs; i>0; i--)    /* move args down a slot */
+				shptr->shargs[i] = shptr->shargs[i-1];
+			shptr->shargs[0] = SHNAME;
+			len += sizeof(SHNAME); 
+			ncargs += 1;
+			for (com = 0 ; com < ncmds ; com++)
+				if (strcmp(cmds[com].cmdnam, SHNAME)==0)
+					break;
+		}
+
+	    /* Handle built-in commands with a procedure call */
+
+		if (cmds[com].cbuiltin) {
+			if (innam!=NULL || outnam!=NULL || errnam!=NULL || backgnd)
+				fprintf(STDERR,"shell: illegal redirection\n");
+			else if ((*cmds[com].cproc)(ncargs,shptr->shargs) == SHEXIT)
+				break;
+			continue;
+		}
+
+	    /* compute space needed for string arg ptrs (in bytes) */
+		len += (ncargs+1)*sizeof(char *) + sizeof(char **);
+		if (isodd(len))
+			++len;
+
+		/* handle non built-in by creating process */
+
+		if ((child = 
+				create(cmds[com].cproc, cmds[com].cmdstk+len, 
+						cmds[com].cmdpri, shptr->shargs[0], 
+						1+(len/sizeof(int)), ncargs
+					  )	// still needs cmd line args: see addarg() later
+		   ) == SYSERR) {
+			fprintf(STDERR,"shell: cannot create \"%s\"\n",
+			shptr->shargs[0]);
+			continue;
+		}
+
+		/* push the ncargs command line args (shargs) on	*/
+		/* child's stack (create() could not do this)		*/
+		addarg(child, ncargs, shptr->shargs, len);
+
+	    /* Handle pipe */
+        
+		if (pipe) {                         /* previous cmd ended with | */
+			pipe = 0;
+			if (innam != NULL) {
+				fprintf(STDERR,
+						"shell: conflicting STDIN redirection\n");
+				continue;
+			}
+			if (redirect(child, STDIN, "pipe", "ro") == SYSERR) 
+				continue;
+		}
+
+		/* Open files and redirect I/O but don't open pipe twice */
+
+		if (redirect(child, STDOUT, outnam, "w") == SYSERR) 
+			continue;
+		if ((strcmp(outnam, errnam)==0) && (strcmp(errnam, "pipe")==0))
+			setpdev(child, STDERR, getpdev(child, STDOUT)); 
+		else if (redirect(child, STDERR, errnam, "w") == SYSERR) 
+			continue;
+	    if (redirect(child, STDIN, innam, "ro") == SYSERR) 
+	    	continue;    
+
+	    if (toktype == '|') {               /* cmd ends with | */
+			if (outnam != NULL) {
+				fprintf(STDERR,
+						"shell: conflicting STDOUT redirection\n");
+				continue;
+			}
+			if (redirect(child, STDOUT, "pipe", "w") == SYSERR) 
+				continue;
+			pipe=1;
+		}
+    
+	    if ( backgnd ) {
+			fprintf(shptr->shcmddev, fmt2, child);
+			resume(child);
+		} 
+	    else {
+			setnok(getpid(), child);
+			control(shptr->shcmddev, TCINT);
+			recvclr();
+			resume(child);
+			for (;;) {
+				msg = receive();
+				if ( msg == TMSGINT ) {        /* Ctrl-B pressed */
+					setnok(BADPID, child);
+					fprintf(STDERR, fmt2, child);
+					break; 
+				}
+				if ( msg == TMSGKILL ) {       /* Ctrl-C pressed */
+					if ( getnok(child) == BADPID) { /* child has no nok */
+						if ( kill(child) == 0 ) /* child is immortal */
+							continue;
+					else
+						break;
+					}
+					break;
+				}
+				if ( msg == child )            /* death of child */
+					break;
+				fprintf(STDERR,
+						"shell: message %d ignored\n",msg);
+			}
+			if (terminate) 
+			toktype = EOF;
+		}
+	} // end of main for
+
+	if(nargs > 1) 
+		close(shptr->shcmddev);
+	freemem(shptr, (word) sizeof(struct shvars));
+	return(OK);
+}
+
+
+/*------------------------------------------------------------------------
+ *  redirect  --  connect the given standard I/O device to the named one
+ *------------------------------------------------------------------------
+ */
+LOCAL redirect(pid, siodev, name, mode)
+int pid, siodev;
+char *name, *mode;
+{
+	int	dev;
+
+	if (name == NULL)
+		return(OK);
+	if ((dev=open(NAMESPACE, name, mode)) != SYSERR) {
+		if (setpdev(pid, siodev, dev) != SYSERR)
+			return(OK);
+		close(dev);
+	}
+
+	fprintf(STDERR, fmt, name);
+	die(pid);                   /* was kill */
+	return(SYSERR);
+}
+
+;- ctxsw.asm - ctxsw
+
+	include ..\h\dos.asm
+
+dseg
+endds
+
+pseg
+	public	_ctxsw
+
+;-------------------------------------------------------------------------
+;- ctxsw  --  context switch from old process to new process
+;-------------------------------------------------------------------------
+;- void ctxsw(void * opp, void * npp);
+;-------------------------------------------------------------------------
+; Per Xinu/8086, il contesto è: CS:IP, BP, FLAGS, SI, DI, DS, SS:SP
+; Il contesto di un processo non corrente risiede: 
+; - sul suo stack (CS:IP, BP, FLAGS, SI, DI, DS) dal basso verso l'alto
+; - in opportune locazioni di memoria (SS:SP).
+;
+;- ctxsw(opp,npp)
+;    salva il contesto del chiamante, il vecchio processo corrente, sul suo stack, 
+;    e SS:SP alla dword puntata da opp;
+;
+;    pone la dword puntata da npp in SS:SP, rendendo lo stack quello
+;    del nuovo processo corrente; da questo stack preleva (dall'alto verso il basso) 
+;    la parte di contesto DS, DI, SI, FLAGS, BP;
+;
+;    ora CS:IP del nuovo processo e` in cima allo stack e il RET finale lo ripristina.
+;
+; Il chiamante mette i far pointer opp, npp sullo stack prima della chiamata.
+;-------------------------------------------------------------------------
+
+_ctxsw	proc	far		; _ is for C compilers
+				; NB: here sp points to old process' ret address
+	push	bp
+	mov	bp,sp		; set stack frame to access opp as [bp+10], npp as [bp+6]
+	pushf			; save flags (especially interrupt flag)
+	cli			; disable interrupts just to be sure
+	push    si		; preserve old process' registers
+	push    di
+; NEXT LINE CAUSES ERROR
+;	push    ds		; not in Xinu (BCC puts it in resched() anyway)
+	les	bx,[bp+10]	; copy to es:bx dword [bp+10] (far pointer to save area for ss:sp)
+	mov	es:[bx],sp	; copy to its save area current (far) stack pointer ss:sp
+	mov	es:[bx+2],ss
+	les	bx,[bp+6]	; dword [bp+6] is far pointer to save area for
+	mov	sp,es:[bx]	;    ss:sp of new process
+	mov	ss,es:[bx+2]
+;-----------------------------	; now ss:sp points to new process' stack
+; NEXT LINE CAUSES ERROR
+;	pop	ds		; restore new process' registers
+	pop     di
+	pop	si
+	popf                    ; restore new process' interrupt state
+	pop	bp		; stack top now new process' ret address
+	ret			; return to what new process was doing
+
+_ctxsw	endp
+
+endps
+	end
+; intmap.asm - 
+; low-level interrupt transfer table and dispatcher
+
+TBLSIZ	equ	20h			; define max size of intmap table
+STKSIZ  equ     1000h                   ; max size of system stack
+
+	public	_sys_imp
+	extrn	_get_cur_ss:far
+
+_FARDATA	SEGMENT WORD PUBLIC 'FAR_DATA'
+_sys_imp	dd	far ptr intmap
+_FARDATA	ENDS
+
+_TEXT	SEGMENT	WORD PUBLIC 'CODE'
+	ASSUME CS:_TEXT, DS:NOTHING
+
+	extrn 	pcxflag:word, sssave:word, spsave:word
+
+intstack	db	STKSIZ dup (0)  ; interrupt stack
+topstack	label	byte
+
+;-------------------------------------------------------------------------
+; intmap  --  hardware interrupt dispatch table
+;-------------------------------------------------------------------------
+intmap	label	byte			; private, accessed via sys_imp
+
+	rept	TBLSIZ
+
+        db      0                       ; ivec   - interrupt vector number
+	call	intcom
+        dd      0                       ; oldisr - old isr from bios (seg:off)
+        dd      0                       ; newisr - new isr code address
+        dw      0                       ; mdevno - minor device number
+        dw      0                       ; iflag  - interrupt flag
+
+	endm
+
+;-------------------------------------------------------------------------
+; intcom  --  common hardware interrupt dispatcher
+;-------------------------------------------------------------------------
+; This procedure is hardware interrupt handling code that is common to all
+; hardware interrupt service routines.
+intcom	proc	near
+
+        push	bp
+	mov	bp,sp
+	push	ax			; save ax and 
+	push	bx			;   bx before they change
+        push	si			; push si,di: maybe BIOS ISR 
+        push	di			;   changes them
+
+; In fact BIOS ISR should also preserve registers, after all
+; but SI and DI have been reported to cause problems.
+
+        mov     bx,[bp+2]		; bx points intmap (past call intcom)
+        mov     ax,cs:[bx+10]		; get iflag from intmap
+	or	al,al			; zero?
+	je	short nobios		; yes: skip call to BIOS ISR
+	pushf				; no: push flags to simulate interrupt
+	call    cs:dword ptr[bx]	; call BIOS ISR
+	cli				; in case BIOS sets interrupts
+
+nobios:
+	push	cx			; save rest of registers
+	push	dx
+	push	ds
+	push	es
+;	push	0ffffh			; debugging (remove)
+	mov	cs:sssave,ss		; save stack (far) pointer
+	mov	cs:spsave,sp
+
+; Se un processo viene interrotto mentre esegue codice Xinu, 
+; lo stack pointer in sssave/spsave punta nello stack del processo, 
+; accessibile via proctab[currpid].pbase.
+;
+; Se invece il processo viene interrotto mentre esegue BIOS (ISR o no), 
+; il BIOS potrebbe avere cambiato stack (anche SS) e DS.
+; Si puo` chiamare new ISR in questo caso?
+; DS non e` un problema: ogni funzione C far lo inizializza nel prologo.
+; Ma e` meglio preparare uno stack locale (piu` grande?)
+
+        push	bx			; preserve bx (points to old ISR)
+        call	_get_cur_ss		; da` 0 se stack cambiato
+        pop	bx			; restore bx
+        or	al,al
+        jz	newstack		; set up stack for new ISR
+
+; we can do our ISR, since the stack belongs to the current process
+
+        push	cs:word ptr[bx+8]	; pass minor dev. no.
+        call	cs:dword ptr[bx+4]	; call C new ISR (saves si, di)
+	add	sp,2			; deallocate parameter (C convention)
+        jmp	short popregs
+
+newstack:		; non si puo` chiamare new ISR con lo stack del BIOS
+        mov	ax,_TEXT		; get text segment address
+        mov	ss,ax			; and set up temporary stack
+        mov	sp,offset cs:topstack
+        xor	ax,ax			; disable rescheduling
+        xchg	ax, cs:pcxflag
+        push	ax          		; salva vecchio pcxflag
+        push	cs:word ptr[bx+8]	; pass minor dev. no.
+        call	cs:dword ptr[bx+4]	; call new ISR (saves si, di)
+        add	sp,2			; deallocate parm. (C convention)
+        pop	cs:pcxflag
+	mov	ss,cs:sssave		; restore old stack
+	mov	sp,cs:spsave
+
+popregs:
+;	pop	es			; annulla il push 0ffffh (elimina)
+	pop	es			; restore all registers
+	pop	ds
+	pop	dx
+	pop	cx
+	pop	di
+	pop	si
+        pop	bx
+	pop	ax
+	pop	bp
+	add	sp,2			; remove pointer to intmap area
+	iret
+intcom	endp
+
+_TEXT ENDS
+
+	end
+
+/* proc.h - isbadpid */
+/* 8086 version */
+
+/* process table declarations and defined constants			*/
+
+#ifndef	NPROC				/* set the number of processes	*/
+#define	NPROC		30		/*  allowed if not already done	*/
+#endif
+
+/* process state constants */
+
+#define PRCURR      '\01'   /* process is currently running */
+#define PRFREE      '\02'   /* process slot is free     */
+#define PRREADY     '\03'   /* process is on ready queue    */
+#define PRRECV      '\04'   /* process waiting for message  */
+#define PRSLEEP     '\05'   /* process is sleeping      */
+#define PRSUSP      '\06'   /* process is suspended     */
+#define PRWAIT      '\07'   /* process is on semaphore queue*/
+#define PRTRECV     '\010'  /* proces is timing a receive   */
+
+/* miscellaneous process definitions */
+
+#define	PNMLEN		9		/* length of process "name"	*/
+#define	NULLPROC	0		/* id of the null process; it	*/
+					/*  is always eligible to run   */
+
+#define BADPID		(-1)    /* used when invalid pid needed */                  
+
+#define	isbadpid(x)	(x<=0 || x>=NPROC)
+
+/* process table entry */
+
+struct	pentry	{
+	char pstate;	/* process state: PRCURR, etc.	*/
+	int	pprio;		/* process priority     */
+	int	psem;		/* semaphore if process waiting */
+	int	pwaitret;	/* return value from wait   */
+	long	pmsg;		/* message sent to this process */
+	int	phasmsg;	/* nonzero iff pmsg is valid    */
+	int	pimmortl;	/* nonzero iff process immortal */
+	char	*pregs;		/* saved environment for ctxsw	*/
+	char	*pbase;		/* base of run time stack	*/
+	int     ssize;          /* size of stack */
+	word    plen;           /* stack length in bytes    */
+//	char	*pglob;		/* ptr to private global data	*/
+//	para	pmlist;		/* allocated memory list	*/
+//	word	pmalloc;	/* paras of allocated memory	*/
+	int	ptarg;		/* argument to ptfn     */
+	int	(*ptfn)();	/* trap function        */
+	int	phastrap;	/* nonzero iff trap is pending  */
+	char	pname[PNMLEN+1];/* process name			*/
+	int	pargs;		/* initial number of arguments  */
+	int	(*paddr)();	/* initial code address     */
+	int  	pnxtkin;	/* next-of-kin notified of death*/
+	int     pdevs[Nsio];    /* devices to close upon exit   */
+	long    oldtime;        /* time at which resched made it current */
+	long    time;           /* CPU time ticks used */
+};
+
+extern	struct	pentry proctab[];
+extern	int	numproc;		/* currently active processes	*/
+extern	int	nextproc;		/* search point for free slot	*/
+extern	int	currpid;		/* currently executing process	*/
+extern  char    *_pglob;    /* ptr to private global data   */
+
+
+;- ctxsw.asm - ctxsw
+
+	include ..\h\dos.asm
+
+dseg
+endds
+
+pseg
+	public	_ctxsw
+
+;-------------------------------------------------------------------------
+;- ctxsw  --  context switch from old process to new process
+;-------------------------------------------------------------------------
+;- void ctxsw(void * opp, void * npp);
+;-------------------------------------------------------------------------
+; Per Xinu/8086, il contesto è: CS:IP, BP, FLAGS, SI, DI, DS, SS:SP
+; Il contesto di un processo non corrente risiede: 
+; - sul suo stack (CS:IP, BP, FLAGS, SI, DI, DS) dal basso verso l'alto
+; - in opportune locazioni di memoria (SS:SP).
+;
+;- ctxsw(opp,npp)
+;    salva il contesto del chiamante, il vecchio processo corrente, sul suo stack, 
+;    e SS:SP alla dword puntata da opp;
+;
+;    pone la dword puntata da npp in SS:SP, rendendo lo stack quello
+;    del nuovo processo corrente; da questo stack preleva (dall'alto verso il basso) 
+;    la parte di contesto DS, DI, SI, FLAGS, BP;
+;
+;    ora CS:IP del nuovo processo e` in cima allo stack e il RET finale lo ripristina.
+;
+; Il chiamante mette i far pointer opp, npp sullo stack prima della chiamata.
+;-------------------------------------------------------------------------
+
+_ctxsw	proc	far		; _ is for C compilers
+				; NB: here sp points to old process' ret address
+	push	bp
+	mov	bp,sp		; set stack frame to access opp as [bp+10], npp as [bp+6]
+	pushf			; save flags (especially interrupt flag)
+	cli			; disable interrupts just to be sure
+	push    si		; preserve old process' registers
+	push    di
+	push    ds		; not in Xinu (BCC puts it in resched() anyway)
+	les	bx,[bp+10]	; copy to es:bx dword [bp+10] (far pointer to save area for ss:sp)
+	mov	es:[bx],sp	; copy to its save area current (far) stack pointer ss:sp
+	mov	es:[bx+2],ss
+
+	les	bx,[bp+6]	; dword [bp+6] is far pointer to save area for
+	mov	sp,es:[bx]	;    ss:sp of new process
+	mov	ss,es:[bx+2]
+;-----------------------------	; now ss:sp points to new process' stack
+	pop	ds		; restore new process' registers
+	pop     di
+	pop	si
+	popf                    ; restore new process' interrupt state
+	pop	bp		; stack top now new process' ret address
+	ret			; return to what new process was doing
+
+_ctxsw	endp
+
+endps
+	end
+# MAKEFILE in dir SRC\
+
+# make causes a make in each dir in $(DIRS)
+# Each TARGET in: clean objs make lib, causes make TARGET in each dir in $(DIRS)
+
+# Moreover make lib reinitializes libraries in $(INITLIBS) to null
+
+!include const.mk
+
+INITLIBS = xkernel.lib xio.lib xutil.lib xshell.lib \
+#	serial.lib
+
+MINDIRS = kernel bufipc devs chardevs minutils
+STNDIRS = kernel bufipc devs chardevs utils \
+	diskdevs dosdevs miscdevs \
+#	serial
+
+!ifdef Npip
+STNDIRS=$(STNDIRS) pipes shell
+!endif
+
+!ifdef WINDOWS
+STNDIRS=$(STNDIRS) windevs
+!endif
+
+DIRS = $(STNDIRS)
+
+
+all: update
+
+recur: $(DIRS)
+
+$(DIRS):
+	cd $*
+!if ($(ARG) == make)
+	makemake
+!else
+	make $(ARG)
+!endif
+	cd ..
+
+const.mk: 
+	cd config
+	make conf
+	cd ..
+	@make -DARG=$(ARG) recur
+
+update:
+	@make -DARG=update const.mk
+
+clean:
+	@make -DARG=clean const.mk
+
+make:	
+	@make -DARG=make const.mk
+
+objs:
+	@make -DARG=objs const.mk
+
+lib:	$(INITLIBS)
+	@make -DARG=lib const.mk
+
+$(INITLIBS):
+	@cd $(L3X)\lib
+	copy proto.lib $<
+	@cd $(L3X)\src
+
+Ntty = 1
+Nxio = 1
+Nsio = 8
+Nnull = 1
+Ndos = 1
+Nmf = 4
+Nnam = 1
+Npipm = 1
+Npip = 4
+NDEVS = 22

@@ -1,0 +1,21 @@
+Possibili semplificazioni:
+
+- eliminare die()
+- eliminare le trap (le usa kill())
+- ripristinare kill()
+- eliminare processi immortali (quasi fatto)
+- eliminare inclusione di mem.h dentro io.h
+
+
+Cercare commenti // (sono miei e segnalano problemi, etc.
+
+
+File coinvolti:
+
+
+C:\tmp\L3X\SRC\KERNEL\KILL.C => C:\user\l3x\SRC\KERNEL\KILL.C
+C:\tmp\L3X\SRC\H\PROC.H => C:\user\l3x\SRC\H\PROC.H
+C:\tmp\L3X\SRC\KERNEL\CREATE.C => C:\user\l3x\SRC\KERNEL\CREATE.C
+C:\tmp\L3X\SRC\KERNEL\RESCHED.C => C:\user\l3x\SRC\KERNEL\RESCHED.C
+C:\tmp\L3X\SRC\KERNEL\DIE.C => C:\user\l3x\SRC\KERNEL\DIE.C
+

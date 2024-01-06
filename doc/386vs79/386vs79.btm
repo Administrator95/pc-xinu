@@ -1,0 +1,26 @@
+@echo off
+IF NOT "%1" == "" goto chk
+
+echo Usage: 386vs79 [-e | -d | -f file]
+echo -e: diff on files in eqlist (almost the same)
+echo -d: diff on files in difflist (very different)
+echo -f: diff on files in second argument
+goto end
+
+:chk
+setlocal
+set FILENAME=eqlist
+IF %1 == -d set FILENAME=difflist
+IF %1 == -f set FILENAME=%2
+
+for %f in (@%FILENAME%) DO GOSUB CKDIF
+
+:CKDIF
+IF "%f" == "" goto end
+echo %f 
+echo ---------
+diff -b \XINU386\PCXNET\SRC\KERNEL\%f \XINU79\PCXNET\SRC\KERNEL\%f
+return
+
+:end
+

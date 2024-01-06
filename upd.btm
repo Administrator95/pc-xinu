@@ -1,0 +1,21 @@
+@echo off
+set NEWDIR=c:\tmp\l3xnew
+set OLDDIR=E:\L3X\SRC
+do f in @changes1.1
+	set FILEN=%@INSTR[3,,%f]
+	set COMM=%@LEFT[1,%f]
+	set TOUCH=%@INSTR[1,1,%f]
+	iff +%1==+-d then ^
+	    iff +%COMM%==+* then ^ iterate ^ endiff
+		diff -b %L3X%\SRC\%[FILEN] %NEWDIR%\%@FILENAME[%[FILEN]]
+REM		*dir /K /M %L3X%\SRC\%[FILEN] %NEWDIR%\%@FILENAME[%[FILEN]]
+		iterate
+	^ endiff
+	iff +%COMM==+o then ^
+		*copy %OLDDIR%\%[FILEN] %L3X%\SRC\%[FILEN]
+		if +%TOUCH%==+t %L3X%\bin\touch %L3X%\SRC\%[FILEN]
+	elseiff +%COMM==+n then ^
+		*copy %NEWDIR%\%@FILENAME[%[FILEN]] %L3X%\SRC\%[FILEN]
+		if +%TOUCH==+t %L3X%\bin\touch %L3X%\SRC\%[FILEN]
+	^ endiff
+enddo 

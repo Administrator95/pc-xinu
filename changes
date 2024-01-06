@@ -1,0 +1,5 @@
+*copy /s /u /n c:\USER\L3X.WIN c:\user\l3x
+
+*copy /s /u /n c:\user\l3x c:\USER\L3X.WIN
+C:\user\l3x\SRC\SHELL\CMD.C => C:\USER\L3X.WIN\SRC\SHELL\CMD.C
+

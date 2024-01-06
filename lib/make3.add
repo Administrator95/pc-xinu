@@ -1,0 +1,20 @@
+update:
+	@make -DUPDATE all
+
+all: $(OBJS)
+
+objs: all
+
+lib: all
+ 	$(LIB) $(L)\$(LIBFILE) $(LIBFLAGS) @xbldlib
+
+clean:
+	del *.obj
+
+make:
+	makemake
+
+xref:
+	objxref @xmodules
+
+

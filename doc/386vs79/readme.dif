@@ -1,0 +1,6 @@
+386KLIST: files in src\kernel for xinu386 (101)
+79KLIST:  files in src\kernel for xinu79 (96)
+XORLIST:  files only in 386KLIST (7) XOR 79KLIST (2)
+ANDLIST:  files (whose name is) in both (94)
+EQLIST:   files in ANDLIST with (nearly) the same contents (75)
+DIFFLIST: files in ANDLIST with very different contents (19)

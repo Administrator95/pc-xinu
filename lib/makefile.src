@@ -1,0 +1,67 @@
+# MAKEFILE in dir SRC\
+
+# make causes a make in each dir in $(DIRS)
+# Each TARGET in: clean objs make lib, causes make TARGET in each dir in $(DIRS)
+
+# Moreover make lib reinitializes libraries in $(INITLIBS) to null
+
+!include const.mk
+
+INITLIBS = xkernel.lib xio.lib xutil.lib xshell.lib \
+#	serial.lib
+
+MINDIRS = kernel bufipc devs chardevs minutils
+STNDIRS = kernel bufipc devs chardevs utils \
+	diskdevs dosdevs miscdevs \
+#	serial
+
+!ifdef Npip
+STNDIRS=$(STNDIRS) pipes shell
+!endif
+
+!ifdef WINDOWS
+STNDIRS=$(STNDIRS) windevs
+!endif
+
+DIRS = $(STNDIRS)
+
+
+all: update
+
+recur: $(DIRS)
+
+$(DIRS):
+	cd $*
+!if ($(ARG) == make)
+	makemake
+!else
+	make $(ARG)
+!endif
+	cd ..
+
+const.mk: 
+	cd config
+	make conf
+	cd ..
+	@make -DARG=$(ARG) recur
+
+update:
+	@make -DARG=update const.mk
+
+clean:
+	@make -DARG=clean const.mk
+
+make:	
+	@make -DARG=make const.mk
+
+objs:
+	@make -DARG=objs const.mk
+
+lib:	$(INITLIBS)
+	@make -DARG=lib const.mk
+
+$(INITLIBS):
+	@cd $(L3X)\lib
+	copy proto.lib $<
+	@cd $(L3X)\src
+

@@ -1,0 +1,14 @@
+# xinu makefile
+
+# For Microsoft MSC:
+COMPILER=MSC
+SWITCHES= /Gs /FPa /I. ;
+
+ASSEMBLER=MASM
+
+.c.obj:
+	$(COMPILER) $* $(SWITCHES)
+     
+.asm.obj:
+	$(ASSEMBLER) $*;
+

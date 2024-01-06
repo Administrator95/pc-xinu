@@ -1,0 +1,43 @@
+# Xinu makefile
+# make builds xinu.exe
+# xinu.exe depends on xinu.obj and xinu libraries (no explicit dependency here)
+#          but is also linked from OBJ of C startup routine and C libraries
+# xinu.obj depends on xinu.c and the header files it includes
+
+
+H = ..\src\h
+L = ..\lib
+
+CC = bcc -mh
+COUTFLAG=-e
+CFLAGS = -I$(H) -L$(L) -w-pia -w-par -DTURBOC
+ASM = tasm /MX /I$(H)
+LIB = tlib
+LIBFLAGS = /c
+
+.c.obj:
+	$(CC) -c $(CFLAGS) $<
+
+.asm.obj:
+	$(ASM) $*;
+
+.obj.exe:
+        $(CC) -e$* $*.obj $(LIBS)
+
+SRCS = xinu.c
+OBJS = junk.obj xinu.obj 
+EXES = xinu.exe
+LIBS = xkernel.lib xio.lib xutil.lib xshell.lib
+
+all:	$(EXES)
+
+xinu.exe: xinu.obj {$(L)}$(LIBS)
+	$(CC) $(COUTFLAG)xinu $(CFLAGS) $*.obj $(LIBS)
+
+clean:  
+	del *.exe
+	del *.obj
+
+make:	
+	makemkmn
+
